@@ -1,30 +1,23 @@
 import os
+import re
 import random
-import time
-import datetime
-import dateutil
-
-import textwrap
-import openai
 import discord
-import asyncio
-import aiohttp
-import json
-
-import pandas as pd
-
-from discord.utils import get
-from pprint import pprint
-from pyairtable import Table
-from discord.ui import Button, View, TextInput, Modal
 from discord.ext import commands
+from discord.ui import View, Button, TextInput, Modal
+import pandas as pd
+import openai
 
-discord_key = os.getenv("CERES_DISCORD_BOT_KEY")
+remote_discord_key = os.getenv("CERES_DISCORD_BOT_KEY")
+discord_key = os.getenv("CERES_GOI_KEY")
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
+
+models = {
+	"ceres": "davinci:ft-personal:ceres-refined-2022-10-21-02-46-56"
+}
 
 training_data = ""
 people = []
@@ -68,6 +61,96 @@ def response_view(modal_text="default text", modal_label="Response", button_labe
 
 	return view, modal
 
+@bot.event
+async def on_message(message):
+
+	# Get Member
+	content = message.content
+	user = message.author
+	channel = message.channel
+
+	print(content)
+	print(user)
+	print(channel)
+
+	if not message.content.startswith("/") and isinstance(message.channel, discord.DMChannel) and message.author != bot.user:
+		await frankenceres(message)
+
+	# Process all commands
+	await bot.process_commands(message)
+
+async def frankenceres(message, answer=""):
+
+	"""
+	Queries Frankenceres
+	"""
+
+	# Get Ceres One Shot Answer First
+	try:
+		distillation = openai.Completion.create(
+			model=models["ceres"],
+			prompt=message.content,
+			temperature=0.55,
+			max_tokens=222,
+			top_p=1,
+			frequency_penalty=1.5,
+			presence_penalty=1.5,
+			stop=["END"]
+		)
+
+		ceres_answer = distillation['choices'][0]['text']
+		ceres_answer = ceres_answer.replace("###", "").strip()
+	except Exception as e:
+		print(f"Error: {e}")
+		ceres_answer = ""
+
+	if len(answer) > 0:
+		ceres_answer = answer + " \n\n" + ceres_answer  
+
+	# Load Chat Context
+	messages = []
+
+	async for hist in message.channel.history(limit=50):
+		if not hist.content.startswith('/'):
+			if hist.embeds:
+				messages.append((hist.author, hist.embeds[0].description))
+			else:
+				messages.append((hist.author.name, hist.content))
+			if len(messages) == 18:
+				break
+
+	messages.reverse()
+
+	# Construct Chat Thread for API
+	conversation = [{"role": "system", "content": "You are are a regenerative bot named Ceres that answers questions about Regen Network"}]
+	conversation.append({"role": "user", "content": "Whatever you say be creative in your response. Never simply summarize, always say it a unique way. I asked Ceres and she said: " + ceres_answer})
+	conversation.append({"role": "assistant", "content": "I am Ceres. I will answer using Ceres as a guide as well as the rest of the conversation. Ceres said " + ceres_answer + " and I will take that into account in my response as best I can"})
+	text_prompt = message.content
+
+	for m in messages:
+		if m[0] == bot.user:
+			conversation.append({"role": "assistant", "content": m[1]})
+		else:
+			conversation.append({"role": "user", "content": m[1]})
+
+	conversation.append({"role": "system", "content": ceres_answer})
+	conversation.append({"role": "user", "content": text_prompt})
+
+	response = openai.ChatCompletion.create(
+		model="gpt-3.5-turbo",
+		temperature=1,
+		messages=conversation
+	)
+
+	response = response.choices[0].message.content.strip()
+
+	# Split response into chunks if longer than 2000 characters
+	if len(response) > 2000:
+		for chunk in [response[i:i+2000] for i in range(0, len(response), 2000)]:
+			await message.channel.send(chunk)
+	else:
+		await message.channel.send(response)
+
 def elaborate(ctx, prompt="prompt"):
 
 	e_prompt = prompt + ". \n\n More thoughts in detail below. \n\n"
@@ -83,7 +166,7 @@ def elaborate(ctx, prompt="prompt"):
 		await interaction.response.defer()
 
 		response = openai.Completion.create(
-			model="davinci:ft-personal:ceres-refined-2022-10-21-02-46-56",
+			model=models["ceres"],
 			prompt=e_prompt,
 			temperature=0.22,
 			max_tokens=222,
@@ -98,7 +181,7 @@ def elaborate(ctx, prompt="prompt"):
 		if len(response_text) == 0:
 
 			response = openai.Completion.create(
-				model="davinci:ft-personal:ceres-refined-2022-10-21-02-46-56",
+				model=models["ceres"],
 				prompt=e_prompt,
 				temperature=0.8,
 				max_tokens=222,
@@ -143,6 +226,34 @@ async def on_ready():
 async def on_close():
 	print("Ceres is offline")
 
+@bot.command()
+async def faq(ctx, *, topic=""):
+
+	df = pd.read_csv('ceres_training-data.csv')
+	prompts = df['prompt'].tolist()
+	question_pattern = r'^(.*)\?\s*$'
+	questions = list(filter(lambda x: isinstance(x, str) and re.match(question_pattern, x, re.IGNORECASE), prompts))
+	questions = list(set(questions))
+
+	question_completion_pairs = []
+
+	# Iterate through each question and find its corresponding completions
+	for question in questions:
+		completions = df.loc[df['prompt'] == question, 'completion'].tolist()
+		for completion in completions:
+			question_completion_pairs.append((question, completion))
+
+	# Remove any duplicate question-completion pairs from the list
+	question_completion_pairs = list(set(question_completion_pairs))
+
+	message = ctx.message
+	random_question = random.choice(question_completion_pairs)
+	embed = discord.Embed(title = "FAQ", description=random_question[0])
+	message.content = random_question[0]
+
+	await ctx.send(embed=embed)
+	await frankenceres(message, answer=random_question[1])
+
 @bot.command(aliases=['ask'])
 async def ceres(ctx, *, thought):
 	"""
@@ -159,7 +270,7 @@ async def ceres(ctx, *, thought):
 	thought_prompt = thought + "\n\n###\n\n"
 
 	response = openai.Completion.create(
-		model="davinci:ft-personal:ceres-refined-2022-10-21-02-46-56",
+		model=models["ceres"],
 		prompt=thought_prompt,
 		temperature=0.69,
 		max_tokens=222,
