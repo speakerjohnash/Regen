@@ -37,6 +37,128 @@ class AskModal(Modal, title="Ask Modal"):
 		print(self.answer)
 		self.view.stop()
 
+def split_text_into_chunks(text, max_chunk_size=2000):
+    """
+    This function splits the input text into smaller chunks, each with a maximum size of max_chunk_size characters.
+    It returns a list of text chunks, ensuring that the text is evenly distributed across the chunks and doesn't break mid-sentence.
+    """
+
+    # Calculate the number of chunks needed to evenly distribute the text
+    num_chunks = max(1, (len(text) + max_chunk_size - 1) // max_chunk_size)
+
+    # Adjust the chunk size to evenly distribute the text across the chunks
+    chunk_size = (len(text) + num_chunks - 1) // num_chunks
+
+    # Initialize variables
+    text_chunks = []
+    start_index = 0
+
+    while start_index < len(text):
+        end_index = start_index + chunk_size
+
+        # Find the nearest sentence boundary before the end_index
+        if end_index < len(text):
+            boundary_index = text.rfind(".", start_index, end_index) + 1
+            if boundary_index > start_index:  # If a boundary is found, update the end_index
+                end_index = boundary_index
+
+        # Add the chunk to the list of chunks
+        text_chunks.append(text[start_index:end_index])
+
+        # Update the start_index for the next iteration
+        start_index = end_index
+
+    return text_chunks
+
+async def get_conversation_history(channel_id, limit, message_count, summary_count_limit):
+	"""
+	Fetches the conversation history from a specified Discord channel.
+	The function retrieves a list of messages from the channel, ignoring slash commands and messages starting with '/'.
+	"""
+
+	channel = bot.get_channel(channel_id)
+	messages = []
+	summary_count = 0
+
+	async for hist in channel.history(limit=limit):
+		if not hist.content.startswith('/'):
+			# Include embeds in the message content
+			embed_content = "\n".join([embed.description for embed in hist.embeds if embed.description]) if hist.embeds else ""
+
+			if hist.author == bot.user:
+				summary_count += 1
+				if summary_count < summary_count_limit:
+					messages.append((hist.author, hist.content + embed_content))
+			else:
+				messages.append((hist.author, hist.content + embed_content))
+			if len(messages) == message_count:
+				break
+
+	return messages
+
+async def ceres_pool(message):
+	"""
+	Assists users in a Discord channel as Ceres
+	"""
+
+	channel_id = 1105541234879111339
+	channel = bot.get_channel(channel_id)
+
+	# Ignore Slash Commands
+	last_message = [message async for message in channel.history(limit=1)][0]
+
+	if last_message.content.startswith("/"):
+		return
+
+	messages = await get_conversation_history(channel_id, 50, 13, 11)
+	messages.reverse()
+
+	# Raw Ceres Answer
+	thought_prompt = messages[-1][1] + "\n\n###\n\n"
+
+	response = openai.Completion.create(
+		model=models["ceres"],
+		prompt=thought_prompt,
+		temperature=0.42,
+		max_tokens=420,
+		top_p=1,
+		frequency_penalty=1.5,
+		presence_penalty=1.5,
+		stop=["END"]
+	)
+
+	text = response['choices'][0]['text']
+	text = text.replace("###", "").strip()
+
+	conversation = [
+		{"role": "system", "content": "You are an interface to Ceres, a regenerative AI made by Regen Network to help teach people about Regen Network and how to regenate the planet"},
+		{"role": "system", "content": "You are mediating a public thread on the Regen Network discord server"}
+	]
+
+	for m in messages:
+		if m[0].id == bot.user.id:
+			conversation.append({"role": "assistant", "content": m[1]})
+		else:
+			conversation.append({"role": "user", "content": f"{m[0].name}: {m[1]}"})
+
+	conversation.append({"role": "system", "content": "You asked Ceres via API the last prompt and Ceres said: " + text})
+	conversation.append({"role": "system", "content": "Answer the user. Prefence the speakers words over Ceres"})
+
+	response = openai.ChatCompletion.create(
+		model="gpt-4",
+		temperature=0.5,
+		messages=conversation
+	)
+
+	response = response.choices[0].message.content.strip()
+
+	# Split response into chunks if longer than 2000 characters
+	response_chunks = split_text_into_chunks(response)
+
+	# Send all response chunks except the last one
+	for chunk in response_chunks:
+		await message.channel.send(chunk)
+
 def response_view(modal_text="default text", modal_label="Response", button_label="Answer"):	
 
 	async def view_timeout():
@@ -60,24 +182,6 @@ def response_view(modal_text="default text", modal_label="Response", button_labe
 	modal.add_view(modal_text, view)
 
 	return view, modal
-
-@bot.event
-async def on_message(message):
-
-	# Get Member
-	content = message.content
-	user = message.author
-	channel = message.channel
-
-	print(content)
-	print(user)
-	print(channel)
-
-	if not message.content.startswith("/") and isinstance(message.channel, discord.DMChannel) and message.author != bot.user:
-		await frankenceres(message)
-
-	# Process all commands
-	await bot.process_commands(message)
 
 async def frankenceres(message, answer=""):
 
@@ -123,8 +227,8 @@ async def frankenceres(message, answer=""):
 
 	# Construct Chat Thread for API
 	conversation = [{"role": "system", "content": "You are are a regenerative bot named Ceres that answers questions about Regen Network"}]
-	conversation.append({"role": "user", "content": "Whatever you say be creative in your response. Never simply summarize, always say it a unique way. I asked Ceres and she said: " + ceres_answer})
-	conversation.append({"role": "assistant", "content": "I am Ceres. I will answer using Ceres as a guide as well as the rest of the conversation. Ceres said " + ceres_answer + " and I will take that into account in my response as best I can"})
+	conversation.append({"role": "user", "content": "Whatever you say be creative in your response. Never simply summarize, always say it a unique way but be brief and clear. I asked Ceres and she said: " + ceres_answer})
+	conversation.append({"role": "assistant", "content": "I am speaking as Ceres. I was trained by Gregory Landua and Speaker John Ash. I will answer using Ceres as a guide as well as the rest of the conversation. Ceres said " + ceres_answer + " and I will take that into account in my response as best I can"})
 	text_prompt = message.content
 
 	for m in messages:
@@ -226,6 +330,35 @@ async def on_ready():
 async def on_close():
 	print("Ceres is offline")
 
+@bot.event
+async def on_message(message):
+
+	# Manage Ceres Pool
+	if message.channel.id == 1105541234879111339 and message.author != bot.user:
+		await ceres_pool(message)
+		await bot.process_commands(message)
+		return
+
+	# Handle DM Chat
+	if not message.content.startswith("/") and isinstance(message.channel, discord.DMChannel) and message.author != bot.user:
+		await frankenceres(message)
+
+	await bot.process_commands(message)
+
+@bot.command(aliases=['c'])
+async def channel(ctx, *, topic=""):
+
+	df = pd.read_csv('ceres_training-data.csv')
+	prompts = df['prompt'].tolist()
+	question_pattern = r'^(.*)\?\s*$'
+	non_questions = list(filter(lambda x: isinstance(x, str) and re.match(question_pattern, x, re.IGNORECASE), prompts))
+
+	random_non_question = random.choice(non_questions)
+	message = ctx.message
+	message.content = "Share a snippet of abstract and analytical wisdom related to the following topic. Be pithy: " + random_non_question
+
+	await frankenceres(message, answer="")
+
 @bot.command()
 async def faq(ctx, *, topic=""):
 
@@ -301,7 +434,6 @@ async def ceres(ctx, *, thought):
 	if modal.answer.value is not None:
 		training_data.loc[len(training_data.index)] = [prompt, modal.answer.value, ctx.message.author.name] 
 		training_data.to_csv('ceres_training-data.csv', encoding='utf-8', index=False)
-
 
 @bot.command()
 async def clarify(ctx, *, thought):
