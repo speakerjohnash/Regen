@@ -7,17 +7,24 @@ from discord.ui import View, Button, TextInput, Modal
 import pandas as pd
 import openai
 
-remote_discord_key = os.getenv("CERES_DISCORD_BOT_KEY")
-discord_key = os.getenv("CERES_GOI_KEY")
-openai.api_key = os.getenv("OPENAI_API_KEY")
+discord_key = os.getenv("CERES_DISCORD_BOT_KEY")
+# local_discord_key = os.getenv("CERES_GOI_KEY")
+# openai.api_key = os.getenv("OPENAI_API_KEY")
+openai.api_key = os.getenv("REGEN_OPENAI_KEY")
 
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
 models = {
-	"ceres": "davinci:ft-personal:ceres-refined-2022-10-21-02-46-56"
+	"ceres-old": "davinci:ft-regen-network-development-inc:ceres-stable-2022-12-11-22-17-03",
+	"ceres-john": "davinci:ft-personal:ceres-refined-2022-10-21-02-46-56",
+	"ceres-0": "ft:gpt-3.5-turbo-0613:regen-network-development-inc::7tPf5URV",
+	"ceres-new": "ft:gpt-3.5-turbo-0613:regen-network-development-inc::7tknfSJC"
 }
+
+with open("ceres_system_instructions.txt", 'r') as file:
+    system_instructions = file.read()
 
 training_data = ""
 people = []
@@ -101,7 +108,8 @@ async def ceres_pool(message):
 	Assists users in a Discord channel as Ceres
 	"""
 
-	channel_id = 1105541234879111339
+	channel_id = 988876280751616050
+	# channel_id = 1105541234879111339
 	channel = bot.get_channel(channel_id)
 
 	# Ignore Slash Commands
@@ -114,21 +122,7 @@ async def ceres_pool(message):
 	messages.reverse()
 
 	# Raw Ceres Answer
-	thought_prompt = messages[-1][1] + "\n\n###\n\n"
-
-	response = openai.Completion.create(
-		model=models["ceres"],
-		prompt=thought_prompt,
-		temperature=0.42,
-		max_tokens=420,
-		top_p=1,
-		frequency_penalty=1.5,
-		presence_penalty=1.5,
-		stop=["END"]
-	)
-
-	text = response['choices'][0]['text']
-	text = text.replace("###", "").strip()
+	ceres_answer = await n_shot(message)
 
 	conversation = [
 		{"role": "system", "content": "You are an interface to Ceres, a regenerative AI made by Regen Network to help teach people about Regen Network and how to regenate the planet"},
@@ -141,7 +135,7 @@ async def ceres_pool(message):
 		else:
 			conversation.append({"role": "user", "content": f"{m[0].name}: {m[1]}"})
 
-	conversation.append({"role": "system", "content": "You asked Ceres via API the last prompt and Ceres said: " + text})
+	conversation.append({"role": "system", "content": "You asked Ceres via API the last prompt and Ceres said: " + ceres_answer})
 	conversation.append({"role": "system", "content": "Answer the user. Prefence the speakers words over Ceres"})
 
 	response = openai.ChatCompletion.create(
@@ -183,33 +177,26 @@ def response_view(modal_text="default text", modal_label="Response", button_labe
 
 	return view, modal
 
-async def frankenceres(message, answer=""):
+async def frankenceres(message, answer="", heat=0.11):
 
 	"""
 	Queries Frankenceres
 	"""
 
-	# Get Ceres One Shot Answer First
-	try:
-		distillation = openai.Completion.create(
-			model=models["ceres"],
-			prompt=message.content,
-			temperature=0.55,
-			max_tokens=222,
-			top_p=1,
-			frequency_penalty=1.5,
-			presence_penalty=1.5,
-			stop=["END"]
-		)
+	gregory = 644279763065634851
+	john = 572900074779049984
 
-		ceres_answer = distillation['choices'][0]['text']
-		ceres_answer = ceres_answer.replace("###", "").strip()
-	except Exception as e:
-		print(f"Error: {e}")
-		ceres_answer = ""
+	testers = [gregory, john]
+
+	# Check if user is Gregory or John
+	use_gpt4 = message.author.id in testers
+
+	# Get Ceres One Shot Answer First
+	ceres_answer = await n_shot(message)
+	print(ceres_answer)
 
 	if len(answer) > 0:
-		ceres_answer = answer + " \n\n" + ceres_answer  
+		ceres_answer = ceres_answer + " \n\n " + answer
 
 	# Load Chat Context
 	messages = []
@@ -220,7 +207,7 @@ async def frankenceres(message, answer=""):
 				messages.append((hist.author, hist.embeds[0].description))
 			else:
 				messages.append((hist.author.name, hist.content))
-			if len(messages) == 18:
+			if len(messages) == 12:
 				break
 
 	messages.reverse()
@@ -240,20 +227,65 @@ async def frankenceres(message, answer=""):
 	conversation.append({"role": "system", "content": ceres_answer})
 	conversation.append({"role": "user", "content": text_prompt})
 
+	model_to_use = "gpt-4" if use_gpt4 else "gpt-3.5-turbo"
+
 	response = openai.ChatCompletion.create(
-		model="gpt-3.5-turbo",
-		temperature=1,
+		model=model_to_use,
+		temperature=heat,
 		messages=conversation
 	)
 
 	response = response.choices[0].message.content.strip()
 
-	# Split response into chunks if longer than 2000 characters
-	if len(response) > 2000:
-		for chunk in [response[i:i+2000] for i in range(0, len(response), 2000)]:
-			await message.channel.send(chunk)
-	else:
-		await message.channel.send(response)
+	response_chunks = split_text_into_chunks(response)
+
+	# Send all response chunks except the last one
+	for chunk in response_chunks:
+		await message.channel.send(chunk)
+
+async def n_shot(message, model="ceres-new", shots=5, heat=0):
+
+	model_name = models[model]
+
+	# Load Chat Context
+	messages = []
+
+	async for hist in message.channel.history(limit=50):
+		if not hist.content.startswith('/') and hist.content.strip():
+			if hist.embeds and hist.embeds[0].description is not None:
+				messages.append((hist.author, hist.embeds[0].description))
+			else:
+				messages.append((hist.author.name, hist.content))
+			if len(messages) == shots:
+				break
+
+	messages.reverse()
+
+	# Construct Chat Thread for API
+	conversation = [{"role": "system", "content": system_instructions}]
+
+	for m in messages:
+		if m[0] == bot.user:
+			conversation.append({"role": "assistant", "content": m[1]})
+		else:
+			conversation.append({"role": "user", "content": m[1]})
+
+	try:
+		response = openai.ChatCompletion.create(
+			model=model_name,
+			messages=conversation,
+			temperature=heat,
+			max_tokens=256,
+			top_p=1,
+			frequency_penalty=1.1,
+			presence_penalty=1.1
+		)
+		iris_answer = response.choices[0].message.content.strip()
+	except Exception as e:
+		print(f"Error: {e}")
+		iris_answer = ""
+
+	return iris_answer
 
 def elaborate(ctx, prompt="prompt"):
 
@@ -334,7 +366,7 @@ async def on_close():
 async def on_message(message):
 
 	# Manage Ceres Pool
-	if message.channel.id == 1105541234879111339 and message.author != bot.user:
+	if message.channel.id == 988876280751616050 and message.author != bot.user:
 		await ceres_pool(message)
 		await bot.process_commands(message)
 		return
@@ -438,7 +470,7 @@ async def ceres(ctx, *, thought):
 @bot.command()
 async def clarify(ctx, *, thought):
 	"""
-	/clarify send thourght to Greogy for clarification
+	/clarify send thourght to Gregory for clarification
 	"""
 
 	global training_data
